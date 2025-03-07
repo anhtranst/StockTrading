@@ -6,7 +6,7 @@
 This project implements a high-performance, lock-free stock trading engine that efficiently matches buy and sell orders in a multi-threaded environment. The system is designed to handle concurrent order processing while ensuring thread safety without traditional locks.
 
 ## Features
-- Support for 1,024 different stock tickers
+- Support for 1,024 different stock tickers with hash collision handling
 - Lock-free concurrent order processing
 - O(n) time complexity for order matching
 - Sorted order books (highest buy price first, lowest sell price first)
@@ -26,15 +26,20 @@ The goal was to develop a stock trading engine that:
 ### Data Structures
 1. **Fixed-Size Array for Tickers**
    - A simple array of size 1,024 holds all ticker data
-   - Each slot contains a pair of order books (buy and sell)
+   - Each slot can contain multiple ticker nodes (for handling hash collisions)
    - FNV-1a hash function maps ticker symbols to array indices
 
-2. **Lock-Free Linked Lists**
+2. **Linked List for Hash Collision Resolution**
+   - Each array slot contains a linked list of TickerNode objects
+   - Each TickerNode represents a unique ticker and contains buy/sell order books
+   - This allows multiple tickers to share the same hash bucket
+
+3. **Lock-Free Linked Lists for Order Books**
    - Buy orders are stored in descending price order
    - Sell orders are stored in ascending price order
    - Pointers between nodes use atomic references
 
-3. **Atomic References**
+4. **Atomic References**
    - Custom implementation that provides thread-safe pointer manipulation
    - Supports Compare-And-Swap (CAS) operations for lock-free updates
 
@@ -48,6 +53,13 @@ Each order contains:
 - Price
 - Unique order ID
 - Timestamp
+
+#### TickerNode
+Represents a single ticker symbol with its associated order books:
+- Ticker symbol
+- Buy order book (as AtomicReference)
+- Sell order book (as AtomicReference)
+- Next pointer (for hash collision resolution)
 
 #### AtomicReference
 Provides thread-safe operations:
@@ -65,13 +77,21 @@ The system uses a lock-free algorithm to insert orders in sorted position:
 
 #### Order Matching (matchOrder)
 Matching follows these steps:
-1. Iterates through all active tickers
-2. For each ticker, checks if the highest buy price meets or exceeds the lowest sell price
-3. If a match is possible, atomically updates quantities
-4. Removes completed orders (quantity = 0)
-5. Continues until no more matches are possible
+1. Iterates through all buckets in the tickers array
+2. For each bucket, traverses the linked list of ticker nodes (handling hash collisions)
+3. For each ticker, checks if the highest buy price meets or exceeds the lowest sell price
+4. If a match is possible, atomically updates quantities
+5. Removes completed orders (quantity = 0)
+6. Continues until no more matches are possible
 
 ## Implementation Details
+
+### Hash Collision Handling
+The implementation uses a chained hash table approach to handle collisions:
+1. Each array slot contains a linked list of ticker nodes
+2. When a hash collision occurs, new tickers are appended to this list
+3. Lookup involves finding the right bucket, then traversing the list to find the specific ticker
+4. This approach maintains O(1) average-case access time while handling any number of collisions
 
 ### Thread Safety Mechanisms
 1. **Atomic Operations**
@@ -136,9 +156,8 @@ You can modify these parameters in the main script:
 - Sample tickers and price ranges
 
 ### Log Files
-The system generates two log files:
-- `trading.log`: General trading activity and performance metrics
-- `order_book_log.txt`: Detailed snapshots of order books
+The system generates a log file:
+- `simple.log`: Trading activity, order matches, and performance metrics
 
 ## Code Structure
 
@@ -150,6 +169,7 @@ The system generates two log files:
 2. `matchOrder()`
    - Matches buy and sell orders across all tickers
    - Returns the number of matches made
+   - Handles hash collisions by traversing ticker node lists
 
 3. `simulate_trading(num_orders, num_threads)`
    - Creates multiple threads that add random orders
@@ -160,9 +180,17 @@ The system generates two log files:
    - Maps ticker symbols to array indices
    - Uses FNV-1a hash algorithm for even distribution
 
-2. `print_order_book(ticker_symbol)`
+2. `get_or_create_books(ticker_symbol)`
+   - Finds or creates order books for a specific ticker
+   - Handles hash collisions appropriately
+
+3. `print_order_book(ticker_symbol)`
    - Outputs the current state of an order book
    - Useful for debugging and verification
+
+4. `add_test_orders()`
+   - Adds predetermined orders to verify matching functionality
+   - Ensures basic functionality works before starting simulation
 
 ## Performance Metrics
 The simulation reports:
@@ -186,5 +214,9 @@ The simulation reports:
    - Current implementation handles 1,024 tickers efficiently
    - For more tickers, a distributed approach would be needed
 
+4. **Hash Collision Optimization**
+   - Current implementation uses simple linked lists for collision resolution
+   - For extremely high collision rates, more sophisticated structures could be used
+
 ## Conclusion
-This lock-free stock trading engine demonstrates how to build high-performance concurrent systems without traditional locks. The implementation satisfies all requirements while maintaining O(n) time complexity for order matching and ensuring thread safety in a multi-threaded environment.
+This lock-free stock trading engine demonstrates how to build high-performance concurrent systems without traditional locks. The implementation satisfies all requirements while maintaining O(n) time complexity for order matching, ensuring thread safety in a multi-threaded environment, and properly handling hash collisions for ticker symbols.
