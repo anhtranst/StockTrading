@@ -6,14 +6,14 @@ from multiprocessing import Value
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, # Logs of INFO, WARNING, ERROR, and CRITICAL will be recorded. DEBUG logs are ignored.
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('simple.log'),
-        logging.StreamHandler()
+        logging.StreamHandler() # Displays logs on the console (terminal output)
     ]
 )
-logger = logging.getLogger('stock_exchange')
+logger = logging.getLogger('stock_exchange') # create a logger object named 'stock_exchange'
 
 NUM_TICKERS = 1024  # Support 1,024 tickers
 tickers = [None] * NUM_TICKERS  # Fixed-size array for tickers, each entry is a linked list of TickerNodes
