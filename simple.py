@@ -16,11 +16,11 @@ logging.basicConfig(
 logger = logging.getLogger('stock_exchange')
 
 NUM_TICKERS = 1024  # Support 1,024 tickers
-tickers = [None] * NUM_TICKERS  # Fixed-size array for tickers
+tickers = [None] * NUM_TICKERS  # Fixed-size array for tickers, each entry is a linked list of TickerNodes
 
 # Constants for retry logic
-MAX_RETRIES = 50   
-MAX_MATCHING_ITERATIONS = 5000  
+MAX_RETRIES = 50   # Maximum number of retries for lock-free operations
+MAX_MATCHING_ITERATIONS = 5000  # Maximum iterations for order matching
 
 
 class AtomicReference:
@@ -37,7 +37,7 @@ class AtomicReference:
         with self._lock:
             self._value = new_value
 
-    def compare_and_set(self, expected, new_value):
+    def compare_and_set(self, expected, new_value): # Ensure the value is unchanged (not interfered by other threads) before setting it to a new value
         """Atomic Compare-and-Swap (CAS)"""
         with self._lock:
             if self._value == expected:
@@ -58,6 +58,15 @@ class Order:
         self.timestamp = time.time()
 
 
+class TickerNode:
+    """ Linked list node to handle hash collisions in tickers array """
+    def __init__(self, ticker_symbol):
+        self.ticker_symbol = ticker_symbol
+        self.buy_book = AtomicReference(None)  # Buy order book
+        self.sell_book = AtomicReference(None)  # Sell order book
+        self.next = None  # Pointer to next TickerNode in case of hash collision
+
+
 def hash_ticker(ticker_symbol):
     """
     A hash function for tickers to distribute them evenly
@@ -70,6 +79,34 @@ def hash_ticker(ticker_symbol):
     return h % NUM_TICKERS
 
 
+def get_or_create_books(ticker_symbol):
+    """ Retrieves or creates the order books for a given ticker, handling hash collisions """
+    index = hash_ticker(ticker_symbol)
+    
+    # If no ticker node at this index yet, create one
+    if tickers[index] is None:
+        new_node = TickerNode(ticker_symbol)
+        tickers[index] = new_node
+        return new_node.buy_book, new_node.sell_book
+
+    # Handle hash collision by traversing linked list
+    current = tickers[index]
+    prev = None
+    
+    # Find matching ticker or end of list
+    while current is not None:
+        if current.ticker_symbol == ticker_symbol:
+            # Found existing ticker, return its books
+            return current.buy_book, current.sell_book
+        prev = current
+        current = current.next
+    
+    # Ticker not found in list, add at end
+    new_node = TickerNode(ticker_symbol)
+    prev.next = new_node
+    return new_node.buy_book, new_node.sell_book
+
+
 def addOrder(order_type, ticker_symbol, quantity, price):
     """ Adds a Buy or Sell order to the appropriate order book """
     if quantity <= 0:
@@ -79,16 +116,9 @@ def addOrder(order_type, ticker_symbol, quantity, price):
     if price <= 0:
         logger.warning(f"Rejected order with invalid price: {price}")
         return None
-        
-    index = hash_ticker(ticker_symbol)
-
-    # Initialize ticker books if not already done
-    if tickers[index] is None:
-        # Attempt to create books atomically
-        new_books = (AtomicReference(None), AtomicReference(None))  # (Buy Book, Sell Book)
-        tickers[index] = new_books  # Directly set - this is safe enough for initialization
-
-    buy_book, sell_book = tickers[index]
+    
+    # Get the appropriate order books for this ticker
+    buy_book, sell_book = get_or_create_books(ticker_symbol)
     new_order = Order(order_type, ticker_symbol, quantity, price)
 
     is_buy = order_type == "Buy"
@@ -179,76 +209,86 @@ def matchOrder():
     """ Matches buy and sell orders across all tickers """
     matches_count = 0
     
-    for index, ticker_books in enumerate(tickers):
-        if ticker_books is None:  # Skip empty entries
-            continue
+    # Iterate through all buckets in the tickers array
+    for index in range(NUM_TICKERS):
+        current_ticker_node = tickers[index]
         
-        buy_book, sell_book = ticker_books
-        iterations = 0
-        
-        while iterations < MAX_MATCHING_ITERATIONS:
-            # Get current heads atomically
-            buy_head = buy_book.get()
-            sell_head = sell_book.get()
+        # Process each ticker in this bucket (handle hash collisions)
+        while current_ticker_node is not None:
+            ticker_symbol = current_ticker_node.ticker_symbol
+            buy_book = current_ticker_node.buy_book
+            sell_book = current_ticker_node.sell_book
+            
+            iterations = 0
+            while iterations < MAX_MATCHING_ITERATIONS:
+                # Get current heads atomically
+                buy_head = buy_book.get()
+                sell_head = sell_book.get()
 
-            # If either book is empty or no match possible, break
-            if buy_head is None or sell_head is None or buy_head.price < sell_head.price:
-                break
+                # If either book is empty or no match possible, break
+                if buy_head is None or sell_head is None:
+                    break
+                
+                if buy_head.price < sell_head.price:
+                    break
 
-            # Try to lock both order quantities
-            try:
-                # Snapshot the quantities before locking
-                buy_qty_before = buy_head.quantity.value
-                sell_qty_before = sell_head.quantity.value
-                
-                # If either order has 0 quantity, remove it and continue
-                if buy_qty_before <= 0:
-                    buy_book.compare_and_set(buy_head, buy_head.next.get())
-                    continue
-                
-                if sell_qty_before <= 0:
-                    sell_book.compare_and_set(sell_head, sell_head.next.get())
-                    continue
-                
-                # Calculate matched quantity
-                matched_quantity = min(buy_qty_before, sell_qty_before)
-                
-                # Lock both quantities for atomic update
-                with buy_head.quantity.get_lock(), sell_head.quantity.get_lock():
-                    # Double-check quantities haven't changed
-                    if buy_head.quantity.value != buy_qty_before or sell_head.quantity.value != sell_qty_before:
-                        # Quantity changed, retry
+                # Try to lock both order quantities
+                try:
+                    # Snapshot the quantities before locking
+                    buy_qty_before = buy_head.quantity.value
+                    sell_qty_before = sell_head.quantity.value
+                    
+                    # If either order has 0 quantity, remove it and continue
+                    if buy_qty_before <= 0:
+                        buy_book.compare_and_set(buy_head, buy_head.next.get())
                         continue
                     
-                    # Update quantities
-                    buy_head.quantity.value -= matched_quantity
-                    sell_head.quantity.value -= matched_quantity
+                    if sell_qty_before <= 0:
+                        sell_book.compare_and_set(sell_head, sell_head.next.get())
+                        continue
+                    
+                    # Calculate matched quantity
+                    matched_quantity = min(buy_qty_before, sell_qty_before)
+                    
+                    # Lock both quantities for atomic update
+                    with buy_head.quantity.get_lock(), sell_head.quantity.get_lock():
+                        # Double-check quantities haven't changed
+                        if buy_head.quantity.value != buy_qty_before or sell_head.quantity.value != sell_qty_before:
+                            # Quantity changed, retry
+                            continue
+                        
+                        # Update quantities
+                        buy_head.quantity.value -= matched_quantity
+                        sell_head.quantity.value -= matched_quantity
+                    
+                    # Log the match
+                    logger.info(f"MATCH: {matched_quantity} shares of {ticker_symbol} at ${sell_head.price:.2f} " +
+                               f"(Buy ID: {buy_head.order_id}, Sell ID: {sell_head.order_id})")
+                    
+                    matches_count += 1
+                    
+                    # Remove orders with zero quantity
+                    if buy_head.quantity.value <= 0:
+                        buy_book.compare_and_set(buy_head, buy_head.next.get())
+                    
+                    if sell_head.quantity.value <= 0:
+                        sell_book.compare_and_set(sell_head, sell_head.next.get())
                 
-                # Log the match
-                logger.info(f"MATCH: {matched_quantity} shares of {buy_head.ticker} at ${sell_head.price:.2f} " +
-                           f"(Buy ID: {buy_head.order_id}, Sell ID: {sell_head.order_id})")
+                except Exception as e:
+                    logger.error(f"Error during order matching: {e} for ticker {ticker_symbol}")
+                    time.sleep(0.001)  # Backoff on error
                 
-                matches_count += 1
+                iterations += 1
                 
-                # Remove orders with zero quantity
-                if buy_head.quantity.value <= 0:
-                    buy_book.compare_and_set(buy_head, buy_head.next.get())
-                
-                if sell_head.quantity.value <= 0:
-                    sell_book.compare_and_set(sell_head, sell_head.next.get())
+                # Avoid CPU spinning too much
+                if iterations % 100 == 0:
+                    time.sleep(0.0001)
             
-            except Exception as e:
-                logger.error(f"Error during order matching: {e}")
-                time.sleep(0.001)  # Backoff on error
+            if iterations >= MAX_MATCHING_ITERATIONS:
+                logger.warning(f"Reached maximum iterations when matching orders for ticker {ticker_symbol}")
             
-            iterations += 1
-            
-            # Avoid CPU spinning too much
-            if iterations % 100 == 0:
-                time.sleep(0.0001)
-        
-        if iterations >= MAX_MATCHING_ITERATIONS:
-            logger.warning(f"Reached maximum iterations when matching orders for ticker at index {index}")
+            # Move to next ticker in this bucket
+            current_ticker_node = current_ticker_node.next
     
     return matches_count
 
@@ -256,31 +296,60 @@ def matchOrder():
 def print_order_book(ticker_symbol):
     """Utility function to print the current state of an order book for debugging"""
     index = hash_ticker(ticker_symbol)
-    if tickers[index] is None:
+    
+    # Find the ticker node in the bucket
+    current = tickers[index]
+    while current is not None:
+        if current.ticker_symbol == ticker_symbol:
+            break
+        current = current.next
+    
+    if current is None:
         logger.info(f"Order book for {ticker_symbol} is empty")
         return
     
-    buy_book, sell_book = tickers[index]
+    buy_book = current.buy_book
+    sell_book = current.sell_book
     
     # Print buy orders
     logger.info(f"BUY ORDERS for {ticker_symbol}:")
-    current = buy_book.get()
-    if current is None:
+    current_order = buy_book.get()
+    if current_order is None:
         logger.info("  No buy orders")
     else:
-        while current:
-            logger.info(f"  {current.quantity.value} shares at ${current.price:.2f} (ID: {current.order_id})")
-            current = current.next.get()
+        while current_order:
+            logger.info(f"  {current_order.quantity.value} shares at ${current_order.price:.2f} (ID: {current_order.order_id})")
+            current_order = current_order.next.get()
     
     # Print sell orders
     logger.info(f"SELL ORDERS for {ticker_symbol}:")
-    current = sell_book.get()
-    if current is None:
+    current_order = sell_book.get()
+    if current_order is None:
         logger.info("  No sell orders")
     else:
-        while current:
-            logger.info(f"  {current.quantity.value} shares at ${current.price:.2f} (ID: {current.order_id})")
-            current = current.next.get()
+        while current_order:
+            logger.info(f"  {current_order.quantity.value} shares at ${current_order.price:.2f} (ID: {current_order.order_id})")
+            current_order = current_order.next.get()
+
+
+def add_test_orders():
+    """Add test orders to verify matching functionality"""
+    # Test case 1: Simple match
+    addOrder("Buy", "TEST", 50, 150.0)
+    addOrder("Sell", "TEST", 50, 149.0)
+    
+    # Test case 2: Partial match
+    addOrder("Buy", "AAPL", 100, 200.0)
+    addOrder("Sell", "AAPL", 50, 195.0)
+    
+    # Test case 3: Multiple matches
+    addOrder("Buy", "GOOG", 200, 300.0)
+    addOrder("Sell", "GOOG", 50, 290.0)
+    addOrder("Sell", "GOOG", 50, 295.0)
+    
+    # Run matching
+    matches = matchOrder()
+    logger.info(f"Test matching completed with {matches} matches")
 
 
 def simulate_trading(num_orders=1000, num_threads=4):
@@ -318,6 +387,9 @@ def simulate_trading(num_orders=1000, num_threads=4):
     threads = [threading.Thread(target=trade_worker) for _ in range(num_threads)]
     
     logger.info(f"Starting trading simulation with {num_orders} orders across {num_threads} threads")
+    
+    # Add some test orders first
+    add_test_orders()
     
     for thread in threads:
         thread.start()
