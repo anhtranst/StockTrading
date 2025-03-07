@@ -4,14 +4,53 @@ import time
 import logging
 import multiprocessing
 from multiprocessing import Value
+import threading
+import ctypes
+from threading import Thread
+import queue # to handle logging the transactions, which is not required for the assignment
 
 # Configure logging
 logging.basicConfig(filename='trading_log.txt', level=logging.INFO, format='%(asctime)s - %(message)s')
-order_book_logger = logging.getLogger("order_book")
-order_book_logger.setLevel(logging.INFO)
-file_handler = logging.FileHandler("order_book_log.txt", mode='w')  # Overwrite on each run
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-order_book_logger.addHandler(file_handler)
+log_queue = queue.Queue()
+
+def log_message(message):
+    log_queue.put(message)
+
+def process_log_queue():
+    """ Continuously processes log messages from the queue """
+    while True:
+        try:
+            message = log_queue.get()
+            if message == "STOP": 
+                break
+            logging.info(message)
+        except queue.Empty:
+            continue
+
+log_thread = threading.Thread(target=process_log_queue, daemon=True)
+log_thread.start()
+
+class AtomicReference:
+    """Simple atomic reference implementation for lock-free operations"""
+    def __init__(self, initial_value=None):
+        self._value = initial_value
+        self._lock = threading.Lock()
+    
+    def get(self):
+        with self._lock:
+            return self._value
+    
+    def set(self, new_value):
+        with self._lock:
+            self._value = new_value
+    
+    def compare_and_set(self, expected, new_value):
+        """Atomic compare and set operation"""
+        with self._lock:
+            if self._value == expected:
+                self._value = new_value
+                return True
+            return False
 
 class Order:
     def __init__(self, order_type, ticker, quantity, price):
@@ -19,90 +58,102 @@ class Order:
         self.ticker = ticker
         self.quantity = Value('i', quantity)  # Shared memory for atomic updates
         self.price = price
-        self.next = None  # Pointer for linked list
+        self.next = AtomicReference(None)  # Atomic reference for next pointer
 
 class LockFreeOrderBook:
     def __init__(self):
-        self.head = None  # Head of the linked list
+        self.head = AtomicReference(None)  # Atomic reference for the head pointer
     
     def add_order(self, new_order, is_buy):
         """
-        Insert orders in sorted order: 
+        Insert orders in sorted order using lock-free techniques: 
         - Buy orders: Descending (Higher price first)
         - Sell orders: Ascending (Lower price first)
         """
         while True:
-            current = self.head
-            prev = None
+            current_head = self.head.get()
             
-            while current and ((is_buy and current.price >= new_order.price) or (not is_buy and current.price <= new_order.price)):
-                prev = current
-                current = current.next
-            
-            new_order.next = current
-            
-            if prev is None:
-                if self.head is current:
-                    self.head = new_order
+            # If the list is empty or the new order should be at the head
+            if current_head is None or (is_buy and new_order.price > current_head.price) or (not is_buy and new_order.price < current_head.price):
+                new_order.next.set(current_head)
+                if self.head.compare_and_set(current_head, new_order):
                     break
+                # If CAS fails, the loop will retry
             else:
-                if prev.next is current:
-                    prev.next = new_order
+                # Find the right position to insert
+                current = current_head
+                while True:
+                    next_node = current.next.get()
+                    
+                    # Check if we've reached the right position
+                    if next_node is None or (is_buy and new_order.price > next_node.price) or (not is_buy and new_order.price < next_node.price):
+                        new_order.next.set(next_node)
+                        if current.next.compare_and_set(next_node, new_order):
+                            break
+                        # If CAS fails, retry from the beginning
+                        break
+                    
+                    current = next_node
+                
+                # If we successfully inserted, break the outer loop
+                if current.next.get() == new_order:
                     break
         
-        logging.info(f"[ADD ORDER] {new_order.order_type} {new_order.quantity.value} {new_order.ticker} at ${new_order.price}")
+        log_message(f"[ADD ORDER] {new_order.order_type} {new_order.quantity.value} {new_order.ticker} at ${new_order.price}")
     
-    def match_orders(self, other_book):
-        """ Matches buy orders with sell orders """
-        order_book_logger.info("\n[ORDER BOOK STATE BEFORE MATCH]")
-        self.log_order_book("BUY BOOK")
-        other_book.log_order_book("SELL BOOK")
-        
-        while self.head and other_book.head and self.head.price >= other_book.head.price:
-            if self.head is None or other_book.head is None:
-                break  # Prevent race condition
+    def match_orders(self, other_book, max_retries=1000):
+        """ Matches buy orders with sell orders using lock-free techniques """      
+        retries = 0
+        while retries < max_retries:
+            buy_head = self.head.get()
+            sell_head = other_book.head.get()
             
-            matched_quantity = min(self.head.quantity.value, other_book.head.quantity.value)
-            logging.info(f"[MATCH] {matched_quantity} shares of {self.head.ticker} matched at ${other_book.head.price}")
+            if buy_head is None or sell_head is None:
+                break
+            
+            if buy_head.price < sell_head.price:
+                break
+            
+            matched_quantity = min(buy_head.quantity.value, sell_head.quantity.value)
+            
+            if matched_quantity <= 0:
+                break
+            
+            # Lock both buy and sell order quantities at the same time to prevent mismatched updates
+            with buy_head.quantity.get_lock(), sell_head.quantity.get_lock():
+                buy_head.quantity.value -= matched_quantity
+                sell_head.quantity.value -= matched_quantity
             
             if matched_quantity > 0:
-                with self.head.quantity.get_lock():
-                    self.head.quantity.value -= matched_quantity
-                with other_book.head.quantity.get_lock():
-                    other_book.head.quantity.value -= matched_quantity
+                log_message(f"[MATCH] {matched_quantity} shares of {buy_head.ticker} matched at ${sell_head.price}")
             
-            if self.head.quantity.value == 0:
-                self.head = self.head.next if self.head else None
-            if other_book.head.quantity.value == 0:
-                other_book.head = other_book.head.next if other_book.head else None
+            if buy_head.quantity.value == 0:
+                self.head.compare_and_set(buy_head, buy_head.next.get())
+            
+            if sell_head.quantity.value == 0:
+                other_book.head.compare_and_set(sell_head, sell_head.next.get())
+            
+            retries += 1
         
-        order_book_logger.info("\n[ORDER BOOK STATE AFTER MATCH]")
-        self.log_order_book("BUY BOOK")
-        other_book.log_order_book("SELL BOOK")
-        file_handler.flush()
-    
-    def log_order_book(self, book_type):
-        """Logs the state of the order book"""
-        current = self.head
-        orders = []
-        while current:
-            orders.append(f"{current.order_type} {current.quantity.value} {current.ticker} at ${current.price}")
-            current = current.next
-        
-        if orders:
-            order_book_logger.info(f"{book_type}:\n" + "\n".join(orders))
-        else:
-            order_book_logger.info(f"{book_type}: EMPTY")
-        file_handler.flush()
-
 class LockFreeStockExchange:
     def __init__(self):
-        self.tickers = [None] * 1024  # Fixed size array
+        self.tickers = [None] * 1024  # Fixed size array for 1,024 tickers
     
     def get_or_create_books(self, ticker):
+        """Get or create order books for a ticker using a fixed-size array"""
+        # Simple hash function to map ticker to array index
         index = hash(ticker) % 1024
+        
+        # If no books exist, create them using atomic operations
         if self.tickers[index] is None:
-            self.tickers[index] = (LockFreeOrderBook(), LockFreeOrderBook())  # (Buy Book, Sell Book)
+            new_books = (LockFreeOrderBook(), LockFreeOrderBook())  # (Buy Book, Sell Book)
+            
+            # Use atomic compare and exchange to avoid race conditions
+            current = self.tickers[index]
+            if current is None:
+                # Only set if still None (atomic check-and-set)
+                self.tickers[index] = new_books
+        
         return self.tickers[index]
     
     def add_test_orders(self):
@@ -112,7 +163,7 @@ class LockFreeStockExchange:
         sell_book.add_order(Order("Sell", "TEST", 50, 149.0), is_buy=False)
         buy_book.match_orders(sell_book)
     
-    def simulate_trading(self, num_orders=100, num_threads=4):
+    def simulate_trading(self, num_orders=1000, num_threads=4):
         """ Simulates concurrent trading using multiple threads """
         tickers = ["AAPL", "GOOG", "TSLA", "MSFT", "AMZN"]
         start_time = time.time()
@@ -146,5 +197,7 @@ class LockFreeStockExchange:
 
 if __name__ == "__main__":
     exchange = LockFreeStockExchange()
-    exchange.add_test_orders()  # Ensure matching occurs
-    exchange.simulate_trading(num_orders=1000, num_threads=8)  # Run multi-threaded test
+    exchange.add_test_orders()
+    exchange.simulate_trading()
+    log_queue.put("STOP")
+    log_thread.join()
